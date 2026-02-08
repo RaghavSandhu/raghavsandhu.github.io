@@ -1,0 +1,14 @@
+[project]
+name = "raghavsandhu-github-io"
+version = "0.1.0"
+requires-python = ">=3.9"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 88
+
+[tool.flake8]
+max-line-length = 88
+extend-ignore = ["E203"]
