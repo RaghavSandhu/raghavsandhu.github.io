@@ -45,6 +45,39 @@ from src.intelligence.stock_screener import screen_stocks
 st.set_page_config(page_title="Stock Trend Predictor", layout="wide")
 
 
+# ── Cached functions ─────────────────────────────────────────────────
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _fetch_data(ticker, period, interval):
+    """Cache stock data for 5 minutes."""
+    df = fetch_stock_data(ticker, period=period, interval=interval)
+    info = get_stock_info(ticker)
+    return df, info
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _prepare(df_json, seq_len, horizon, threshold):
+    """Cache feature engineering (keyed on data hash)."""
+    df = pd.read_json(df_json)
+    return prepare_dataset(df, sequence_length=seq_len, horizon=horizon, threshold=threshold)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _get_full_df(df_json, horizon, threshold):
+    df = pd.read_json(df_json)
+    df_full = add_technical_indicators(df)
+    df_full = create_targets(df_full, horizon=horizon, threshold=threshold)
+    df_full.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df_full.dropna(inplace=True)
+    return df_full
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _fetch_news(ticker):
+    """Cache news for 10 minutes."""
+    return fetch_all_news(ticker, max_ticker=8, max_market=3)
+
+
 def main():
     st.title("Stock Trend Predictor — Intraday Trading")
     st.caption(
@@ -63,14 +96,24 @@ def main():
         seq_len = st.slider("Sequence length", 10, 50, 20)
 
         st.subheader("Training")
-        epochs = st.slider("Epochs (LSTM/Transformer)", 10, 100, 30)
-        rl_episodes = st.slider("RL episodes", 20, 200, 50)
+        speed_mode = st.radio("Speed", ["Fast", "Balanced", "Thorough"],
+                              index=0, horizontal=True,
+                              help="Fast: ~30s | Balanced: ~1min | Thorough: ~3min")
+
+        if speed_mode == "Fast":
+            epochs, rl_episodes, xgb_n = 5, 10, 50
+        elif speed_mode == "Balanced":
+            epochs, rl_episodes, xgb_n = 15, 30, 100
+        else:
+            epochs, rl_episodes, xgb_n = 30, 50, 200
+
+        st.caption(f"Epochs: {epochs} | RL episodes: {rl_episodes}")
 
         st.subheader("LLM Intelligence")
         llm_status = "Connected" if has_llm_access() else "Not configured"
         st.caption(f"Claude API: **{llm_status}**")
         if not has_llm_access():
-            st.caption("Set `ANTHROPIC_API_KEY` env var for AI-powered analysis")
+            st.caption("Set `ANTHROPIC_API_KEY` for AI-powered analysis")
 
         run_btn = st.button("Run Analysis", type="primary", use_container_width=True)
 
@@ -79,32 +122,34 @@ def main():
         return
 
     # ── Fetch data ────────────────────────────────────────────────────
-    with st.status("Fetching market data...", expanded=True) as status:
-        try:
-            df = fetch_stock_data(ticker, period=period, interval=interval)
-            info = get_stock_info(ticker)
-            st.write(f"**{info['name']}** | {info['sector']} | {len(df)} candles loaded")
-        except Exception as e:
-            st.error(f"Failed to fetch data: {e}")
-            return
+    progress = st.progress(0, text="Fetching market data...")
 
-        status.update(label="Computing technical indicators...", state="running")
-        (
-            feature_cols, X_train, X_test,
-            y_train_dir, y_test_dir,
-            y_train_ret, y_test_ret,
-            train_dates, test_dates,
-            scaler,
-        ) = prepare_dataset(df, sequence_length=seq_len, horizon=horizon, threshold=threshold)
+    try:
+        df, info = _fetch_data(ticker, period, interval)
+        st.write(f"**{info['name']}** | {info['sector']} | {len(df)} candles loaded")
+    except Exception as e:
+        st.error(f"Failed to fetch data: {e}")
+        return
 
-        if len(X_train) < seq_len + 10 or len(X_test) < seq_len + 10:
-            st.error("Not enough data for training. Try a longer period or shorter interval.")
-            return
+    progress.progress(10, text="Computing technical indicators...")
 
-        st.write(f"Features: **{len(feature_cols)}** | "
-                 f"Train: **{len(X_train)}** samples | "
-                 f"Test: **{len(X_test)}** samples")
-        status.update(label="Data ready", state="complete")
+    # Serialize df for caching (avoids unhashable DataFrame)
+    df_json = df.to_json()
+
+    (
+        feature_cols, X_train, X_test,
+        y_train_dir, y_test_dir,
+        y_train_ret, y_test_ret,
+        train_dates, test_dates,
+        scaler,
+    ) = _prepare(df_json, seq_len, horizon, threshold)
+
+    if len(X_train) < seq_len + 10 or len(X_test) < seq_len + 10:
+        st.error("Not enough data for training. Try a longer period or shorter interval.")
+        return
+
+    st.write(f"Features: **{len(feature_cols)}** | "
+             f"Train: **{len(X_train)}** | Test: **{len(X_test)}**")
 
     # ── Train models ──────────────────────────────────────────────────
     tabs = st.tabs([
@@ -114,64 +159,61 @@ def main():
     ])
     tab_chart, tab_train, tab_explain, tab_rl, tab_backtest, tab_news, tab_strategy, tab_screener = tabs
 
-    with st.status("Training models...", expanded=True) as status:
-        # XGBoost
-        status.update(label="Training XGBoost...", state="running")
-        xgb = XGBoostModel()
-        xgb_metrics = xgb.train(X_train, y_train_dir, X_test, y_test_dir)
+    # XGBoost (fast)
+    progress.progress(20, text="Training XGBoost...")
+    xgb = XGBoostModel(n_estimators=xgb_n)
+    xgb_metrics = xgb.train(X_train, y_train_dir, X_test, y_test_dir)
 
-        # LSTM
-        status.update(label="Training LSTM...", state="running")
-        lstm = LSTMModel(seq_len=seq_len, epochs=epochs, batch_size=64)
-        lstm_metrics = lstm.train(X_train, y_train_dir, X_test, y_test_dir)
+    # LSTM
+    progress.progress(40, text="Training LSTM...")
+    lstm = LSTMModel(seq_len=seq_len, epochs=epochs, batch_size=64)
+    lstm_metrics = lstm.train(X_train, y_train_dir, X_test, y_test_dir)
 
-        # Transformer
-        status.update(label="Training Transformer...", state="running")
-        transformer = TransformerModel(seq_len=seq_len, epochs=epochs, batch_size=64)
-        trans_metrics = transformer.train(X_train, y_train_dir, X_test, y_test_dir)
+    # Transformer
+    progress.progress(60, text="Training Transformer...")
+    transformer = TransformerModel(seq_len=seq_len, epochs=epochs, batch_size=64)
+    trans_metrics = transformer.train(X_train, y_train_dir, X_test, y_test_dir)
 
-        # Ensemble
-        ensemble = EnsemblePredictor(
-            {"LSTM": lstm, "XGBoost": xgb, "Transformer": transformer},
-            seq_len=seq_len,
-        )
-        ensemble.update_weights(X_test, y_test_dir)
+    # Ensemble
+    progress.progress(70, text="Building ensemble...")
+    ensemble = EnsemblePredictor(
+        {"LSTM": lstm, "XGBoost": xgb, "Transformer": transformer},
+        seq_len=seq_len,
+    )
+    ensemble.update_weights(X_test, y_test_dir)
 
-        # RL Agent
-        status.update(label="Training RL agent...", state="running")
-        df_full = add_technical_indicators(df)
-        df_full = create_targets(df_full, horizon=horizon, threshold=threshold)
-        df_full.replace([np.inf, -np.inf], np.nan, inplace=True)
-        df_full.dropna(inplace=True)
+    # RL Agent
+    progress.progress(80, text="Training RL agent...")
+    df_full = _get_full_df(df_json, horizon, threshold)
 
-        test_prices = df_full["Close"].values[-len(X_test):]
-        ensemble_preds = ensemble.predict(X_test)
-        ensemble_conf = ensemble.get_confidence(X_test)
+    test_prices = df_full["Close"].values[-len(X_test):]
+    ensemble_preds = ensemble.predict(X_test)
+    ensemble_conf = ensemble.get_confidence(X_test)
 
-        min_len = min(len(test_prices), len(ensemble_preds), len(ensemble_conf))
-        rl_prices = test_prices[-min_len:]
-        rl_preds = ensemble_preds[-min_len:]
-        rl_confs = ensemble_conf[-min_len:]
-        rl_features = X_test[-min_len:, :8]
+    min_len = min(len(test_prices), len(ensemble_preds), len(ensemble_conf))
+    rl_prices = test_prices[-min_len:]
+    rl_preds = ensemble_preds[-min_len:]
+    rl_confs = ensemble_conf[-min_len:]
+    rl_features = X_test[-min_len:, :8]
 
-        env = TradingEnvironment(rl_prices, rl_preds, rl_confs, rl_features)
-        agent = DQNAgent(state_size=env.state_size, epsilon=1.0)
-        rl_metrics = agent.train_on_env(env, episodes=rl_episodes)
+    env = TradingEnvironment(rl_prices, rl_preds, rl_confs, rl_features)
+    agent = DQNAgent(state_size=env.state_size, epsilon=1.0)
+    rl_metrics = agent.train_on_env(env, episodes=rl_episodes)
 
-        # Gather technical summary for intelligence layer
-        last_row = df_full.iloc[-1]
-        technical_data = {
-            "rsi": last_row.get("RSI"),
-            "macd_hist": last_row.get("MACD_hist"),
-            "adx": last_row.get("ADX"),
-            "atr": last_row.get("ATR"),
-            "bb_pct": last_row.get("BB_pct"),
-            "volatility_20": last_row.get("volatility_20"),
-            "volume_ratio": last_row.get("volume_ratio"),
-        }
-        current_price = float(df_full["Close"].iloc[-1])
+    # Technical summary for intelligence layer
+    last_row = df_full.iloc[-1]
+    technical_data = {
+        "rsi": last_row.get("RSI"),
+        "macd_hist": last_row.get("MACD_hist"),
+        "adx": last_row.get("ADX"),
+        "atr": last_row.get("ATR"),
+        "bb_pct": last_row.get("BB_pct"),
+        "volatility_20": last_row.get("volatility_20"),
+        "volume_ratio": last_row.get("volume_ratio"),
+    }
+    current_price = float(df_full["Close"].iloc[-1])
 
-        status.update(label="All models trained", state="complete")
+    progress.progress(100, text="Done!")
 
     # ── Tab 1: Live Chart & Predictions ───────────────────────────────
     with tab_chart:
@@ -301,7 +343,9 @@ def main():
         explainer = PredictionExplainer(xgb, feature_cols)
 
         st.markdown("### Global Feature Importance (SHAP)")
-        importance = explainer.get_global_feature_importance(X_test, top_n=15)
+        # Use subset for SHAP speed
+        shap_subset = X_test[:50] if len(X_test) > 50 else X_test
+        importance = explainer.get_global_feature_importance(shap_subset, top_n=15)
 
         fig_imp = go.Figure(go.Bar(
             x=[d["importance"] for d in importance],
@@ -435,19 +479,16 @@ def main():
             st.info("Using rule-based sentiment analysis. Set `ANTHROPIC_API_KEY` for AI-powered insights.")
 
         with st.spinner("Fetching news..."):
-            news_items = fetch_all_news(ticker, max_ticker=10, max_market=3)
+            news_items = _fetch_news(ticker)
 
         if not news_items:
             st.warning("No news found. This may be due to network restrictions.")
         else:
-            # Sentiment analysis
             sentiment = analyze_sentiment(
                 ticker, news_items, current_price, technical_data
             )
 
-            # Sentiment dashboard
             col1, col2, col3, col4 = st.columns(4)
-            sentiment_color = {"BULLISH": "normal", "BEARISH": "inverse", "NEUTRAL": "off"}
             col1.metric("Sentiment", sentiment.overall_sentiment)
             col2.metric("Confidence", f"{sentiment.confidence:.0%}")
             col3.metric("News Impact", sentiment.news_impact)
@@ -460,7 +501,6 @@ def main():
             for driver in sentiment.key_drivers:
                 st.markdown(f"- {driver}")
 
-            # News feed
             st.markdown("### Latest News")
             for item in news_items[:10]:
                 with st.expander(f"[{item.source}] {item.title}"):
@@ -473,12 +513,11 @@ def main():
     with tab_strategy:
         st.subheader("Risk Assessment & Strategy Advisor")
 
-        # Run risk + sentiment if not done
+        # Ensure sentiment is available
         if "sentiment" not in dir():
-            news_items = fetch_all_news(ticker, max_ticker=5, max_market=2)
+            news_items = _fetch_news(ticker)
             sentiment = analyze_sentiment(ticker, news_items, current_price, technical_data)
 
-        # Model predictions summary
         model_pred_summary = {
             "direction": direction_map.get(latest_pred, "NEUTRAL"),
             "confidence": f"{latest_conf:.0%}",
@@ -486,7 +525,6 @@ def main():
             "rl_action": ACTION_NAMES.get(rl_action, "HOLD"),
         }
 
-        # Risk assessment
         st.markdown("### Risk Assessment")
         risk = assess_risk(ticker, current_price, technical_data, sentiment, model_pred_summary)
 
@@ -510,7 +548,6 @@ def main():
             for suggestion in risk.hedging_suggestions:
                 st.markdown(f"- {suggestion}")
 
-        # Strategy advice
         st.markdown("---")
         st.markdown("### Trading Strategies")
         advice = get_strategy_advice(
@@ -581,7 +618,6 @@ def main():
             else:
                 st.success(f"Found {len(results)} opportunities")
 
-                # Signal color coding
                 def color_signal(val):
                     colors = {
                         "STRONG BUY": "background-color: #1a5c1a",
@@ -603,7 +639,6 @@ def main():
                     hide_index=True,
                 )
 
-                # Top picks detail
                 st.markdown("### Top Picks")
                 for _, row in results.head(5).iterrows():
                     st.markdown(
