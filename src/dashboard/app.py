@@ -1,5 +1,14 @@
 """Streamlit dashboard for the stock prediction app."""
 
+import sys
+from pathlib import Path
+
+# Ensure repo root is on sys.path so `from src.` imports work everywhere
+# (needed for Streamlit Cloud which doesn't set PYTHONPATH)
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import streamlit as st
 import numpy as np
 import pandas as pd
