@@ -1,10 +1,10 @@
-def greet(name: str) -> str:
-    return f"Hello, {name}!"
+"""Entry point for the Stock Trend Predictor app.
 
+Usage:
+    streamlit run src/main.py
+"""
 
-def main():
-    print(greet("world"))
-
+from src.dashboard.app import main
 
 if __name__ == "__main__":
     main()
